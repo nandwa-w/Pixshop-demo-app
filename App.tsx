@@ -6,12 +6,13 @@
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import ReactCrop, { type Crop, type PixelCrop } from 'react-image-crop';
-import { generateEditedImage, generateFilteredImage, generateAdjustedImage } from './services/geminiService';
+import { generateEditedImage, generateFilteredImage, generateAdjustedImage, detectObjects, generateObjectEdit } from './services/geminiService';
 import Header from './components/Header';
 import Spinner from './components/Spinner';
 import FilterPanel from './components/FilterPanel';
 import AdjustmentPanel from './components/AdjustmentPanel';
 import CropPanel from './components/CropPanel';
+import ObjectsPanel from './components/ObjectsPanel';
 import { UndoIcon, RedoIcon, EyeIcon } from './components/icons';
 import StartScreen from './components/StartScreen';
 
@@ -32,21 +33,41 @@ const dataURLtoFile = (dataurl: string, filename: string): File => {
     return new File([u8arr], filename, {type:mime});
 }
 
-type Tab = 'retouch' | 'adjust' | 'filters' | 'crop';
+// Type definitions
+type Tab = 'retouch' | 'objects' | 'adjust' | 'filters' | 'crop';
+
+export interface BoundingBox {
+    x1: number; y1: number; x2: number; y2: number;
+}
+export interface DetectedObject {
+    name: string;
+    boundingBox: BoundingBox;
+}
 
 const App: React.FC = () => {
+  // History and image state
   const [history, setHistory] = useState<File[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
   const [prompt, setPrompt] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [editHotspot, setEditHotspot] = useState<{ x: number, y: number } | null>(null);
-  const [displayHotspot, setDisplayHotspot] = useState<{ x: number, y: number } | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('retouch');
   
+  // Retouch state
+  const [editHotspot, setEditHotspot] = useState<{ x: number, y: number } | null>(null);
+  const [displayHotspot, setDisplayHotspot] = useState<{ x: number, y: number } | null>(null);
+  
+  // Object detection state
+  const [detectedObjects, setDetectedObjects] = useState<DetectedObject[] | null>(null);
+  const [selectedObject, setSelectedObject] = useState<DetectedObject | null>(null);
+  const [hoveredObject, setHoveredObject] = useState<DetectedObject | null>(null);
+  const [isDetecting, setIsDetecting] = useState<boolean>(false);
+
+  // Crop state
   const [crop, setCrop] = useState<Crop>();
   const [completedCrop, setCompletedCrop] = useState<PixelCrop>();
   const [aspect, setAspect] = useState<number | undefined>();
+  
   const [isComparing, setIsComparing] = useState<boolean>(false);
   const imgRef = useRef<HTMLImageElement>(null);
 
@@ -56,7 +77,6 @@ const App: React.FC = () => {
   const [currentImageUrl, setCurrentImageUrl] = useState<string | null>(null);
   const [originalImageUrl, setOriginalImageUrl] = useState<string | null>(null);
 
-  // Effect to create and revoke object URLs safely for the current image
   useEffect(() => {
     if (currentImage) {
       const url = URL.createObjectURL(currentImage);
@@ -67,7 +87,6 @@ const App: React.FC = () => {
     }
   }, [currentImage]);
   
-  // Effect to create and revoke object URLs safely for the original image
   useEffect(() => {
     if (originalImage) {
       const url = URL.createObjectURL(originalImage);
@@ -90,18 +109,28 @@ const App: React.FC = () => {
     // Reset transient states after an action
     setCrop(undefined);
     setCompletedCrop(undefined);
+    setSelectedObject(null);
+    setHoveredObject(null);
   }, [history, historyIndex]);
+  
+  const resetAllStates = useCallback(() => {
+      setHistory([]);
+      setHistoryIndex(-1);
+      setError(null);
+      setPrompt('');
+      setEditHotspot(null);
+      setDisplayHotspot(null);
+      setDetectedObjects(null);
+      setSelectedObject(null);
+      setHoveredObject(null);
+  }, []);
 
   const handleImageUpload = useCallback((file: File) => {
-    setError(null);
+    resetAllStates();
     setHistory([file]);
     setHistoryIndex(0);
-    setEditHotspot(null);
-    setDisplayHotspot(null);
     setActiveTab('retouch');
-    setCrop(undefined);
-    setCompletedCrop(undefined);
-  }, []);
+  }, [resetAllStates]);
 
   const handleGenerate = useCallback(async () => {
     if (!currentImage) {
@@ -137,6 +166,60 @@ const App: React.FC = () => {
     }
   }, [currentImage, prompt, editHotspot, addImageToHistory]);
   
+  const handleDetectObjects = useCallback(async () => {
+      if (!currentImage) {
+        setError('No image to detect objects from.');
+        return;
+      }
+      setIsDetecting(true);
+      setError(null);
+      setDetectedObjects(null);
+      setSelectedObject(null);
+      try {
+        const objects = await detectObjects(currentImage);
+        setDetectedObjects(objects);
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+        setError(`Failed to detect objects. ${errorMessage}`);
+        console.error(err);
+      } finally {
+          setIsDetecting(false);
+      }
+  }, [currentImage]);
+
+  const handleGenerateObjectEdit = useCallback(async (objectPrompt: string) => {
+      if (!currentImage || !selectedObject) {
+          setError('No image or object selected for editing.');
+          return;
+      }
+      setIsLoading(true);
+      setError(null);
+      
+      try {
+          const image = new Image();
+          image.src = currentImageUrl!;
+          await image.decode();
+          const { naturalWidth, naturalHeight } = image;
+          
+          const pixelBox = {
+              x1: Math.round(selectedObject.boundingBox.x1 * naturalWidth),
+              y1: Math.round(selectedObject.boundingBox.y1 * naturalHeight),
+              x2: Math.round(selectedObject.boundingBox.x2 * naturalWidth),
+              y2: Math.round(selectedObject.boundingBox.y2 * naturalHeight),
+          };
+
+          const editedImageUrl = await generateObjectEdit(currentImage, objectPrompt, pixelBox);
+          const newImageFile = dataURLtoFile(editedImageUrl, `obj-edited-${Date.now()}.png`);
+          addImageToHistory(newImageFile);
+      } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+          setError(`Failed to edit object. ${errorMessage}`);
+          console.error(err);
+      } finally {
+          setIsLoading(false);
+      }
+  }, [currentImage, selectedObject, currentImageUrl, addImageToHistory]);
+
   const handleApplyFilter = useCallback(async (filterPrompt: string) => {
     if (!currentImage) {
       setError('No image loaded to apply a filter to.');
@@ -230,6 +313,7 @@ const App: React.FC = () => {
       setHistoryIndex(historyIndex - 1);
       setEditHotspot(null);
       setDisplayHotspot(null);
+      setSelectedObject(null);
     }
   }, [canUndo, historyIndex]);
   
@@ -238,6 +322,7 @@ const App: React.FC = () => {
       setHistoryIndex(historyIndex + 1);
       setEditHotspot(null);
       setDisplayHotspot(null);
+      setSelectedObject(null);
     }
   }, [canRedo, historyIndex]);
 
@@ -247,17 +332,14 @@ const App: React.FC = () => {
       setError(null);
       setEditHotspot(null);
       setDisplayHotspot(null);
+      setDetectedObjects(history.length > 1 ? null : detectedObjects);
+      setSelectedObject(null);
     }
-  }, [history]);
+  }, [history, detectedObjects]);
 
   const handleUploadNew = useCallback(() => {
-      setHistory([]);
-      setHistoryIndex(-1);
-      setError(null);
-      setPrompt('');
-      setEditHotspot(null);
-      setDisplayHotspot(null);
-  }, []);
+    resetAllStates();
+  }, [resetAllStates]);
 
   const handleDownload = useCallback(() => {
       if (currentImage) {
@@ -298,6 +380,16 @@ const App: React.FC = () => {
     setEditHotspot({ x: originalX, y: originalY });
 };
 
+  const handleTabChange = (tab: Tab) => {
+    setActiveTab(tab);
+    // Reset selections when changing tabs
+    setHoveredObject(null);
+    setSelectedObject(null);
+    setEditHotspot(null);
+    setDisplayHotspot(null);
+    setCrop(undefined);
+  };
+
   const renderContent = () => {
     if (error) {
        return (
@@ -318,9 +410,10 @@ const App: React.FC = () => {
       return <StartScreen onFileSelect={handleFileSelect} />;
     }
 
+    const objectToHighlight = hoveredObject || selectedObject;
+
     const imageDisplay = (
       <div className="relative">
-        {/* Base image is the original, always at the bottom */}
         {originalImageUrl && (
             <img
                 key={originalImageUrl}
@@ -329,7 +422,6 @@ const App: React.FC = () => {
                 className="w-full h-auto object-contain max-h-[60vh] rounded-xl pointer-events-none"
             />
         )}
-        {/* The current image is an overlay that fades in/out for comparison */}
         <img
             ref={imgRef}
             key={currentImageUrl}
@@ -338,10 +430,27 @@ const App: React.FC = () => {
             onClick={handleImageClick}
             className={`absolute top-0 left-0 w-full h-auto object-contain max-h-[60vh] rounded-xl transition-opacity duration-200 ease-in-out ${isComparing ? 'opacity-0' : 'opacity-100'} ${activeTab === 'retouch' ? 'cursor-crosshair' : ''}`}
         />
+
+        {objectToHighlight && (
+          <div
+            className={`absolute pointer-events-none transition-all duration-150 rounded-md ${selectedObject === objectToHighlight ? 'border-blue-500 border-2 shadow-2xl shadow-blue-500/50' : 'border-blue-400 border-dashed border-2'}`}
+            style={{
+              left: `${objectToHighlight.boundingBox.x1 * 100}%`,
+              top: `${objectToHighlight.boundingBox.y1 * 100}%`,
+              width: `${(objectToHighlight.boundingBox.x2 - objectToHighlight.boundingBox.x1) * 100}%`,
+              height: `${(objectToHighlight.boundingBox.y2 - objectToHighlight.boundingBox.y1) * 100}%`,
+            }}
+          >
+            {selectedObject === objectToHighlight && (
+              <span className="absolute -top-7 left-0 bg-blue-500 text-white text-xs font-bold px-2 py-1 rounded">
+                {selectedObject.name}
+              </span>
+            )}
+          </div>
+        )}
       </div>
     );
     
-    // For ReactCrop, we need a single image element. We'll use the current one.
     const cropImageElement = (
       <img 
         ref={imgRef}
@@ -386,10 +495,10 @@ const App: React.FC = () => {
         </div>
         
         <div className="w-full bg-gray-800/80 border border-gray-700/80 rounded-lg p-2 flex items-center justify-center gap-2 backdrop-blur-sm">
-            {(['retouch', 'crop', 'adjust', 'filters'] as Tab[]).map(tab => (
+            {(['retouch', 'objects', 'crop', 'adjust', 'filters'] as Tab[]).map(tab => (
                  <button
                     key={tab}
-                    onClick={() => setActiveTab(tab)}
+                    onClick={() => handleTabChange(tab)}
                     className={`w-full capitalize font-semibold py-3 px-5 rounded-md transition-all duration-200 text-base ${
                         activeTab === tab 
                         ? 'bg-gradient-to-br from-blue-500 to-cyan-400 text-white shadow-lg shadow-cyan-500/40' 
@@ -426,6 +535,7 @@ const App: React.FC = () => {
                     </form>
                 </div>
             )}
+            {activeTab === 'objects' && <ObjectsPanel onDetect={handleDetectObjects} isDetecting={isDetecting} isLoading={isLoading} objects={detectedObjects} selectedObject={selectedObject} onObjectSelect={setSelectedObject} onObjectHover={setHoveredObject} onGenerate={handleGenerateObjectEdit} />}
             {activeTab === 'crop' && <CropPanel onApplyCrop={handleApplyCrop} onSetAspect={setAspect} isLoading={isLoading} isCropping={!!completedCrop?.width && completedCrop.width > 0} />}
             {activeTab === 'adjust' && <AdjustmentPanel onApplyAdjustment={handleApplyAdjustment} isLoading={isLoading} />}
             {activeTab === 'filters' && <FilterPanel onApplyFilter={handleApplyFilter} isLoading={isLoading} />}

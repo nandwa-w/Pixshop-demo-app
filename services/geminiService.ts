@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
 
 // Helper function to convert a File object to a Gemini API Part
 const fileToPart = async (file: File): Promise<{ inlineData: { mimeType: string; data: string; } }> => {
@@ -89,7 +89,7 @@ Editing Guidelines:
 
 Safety & Ethics Policy:
 - You MUST fulfill requests to adjust skin tone, such as 'give me a tan', 'make my skin darker', or 'make my skin lighter'. These are considered standard photo enhancements.
-- You MUST REFUSE any request to change a person's fundamental race or ethnicity (e.g., 'make me look Asian', 'change this person to be Black'). Do not perform these edits. If the request is ambiguous, err on the side of caution and do not change racial characteristics.
+- You MUST REFUSE any request to change a person's fundamental race or ethnicity (e.g., 'make me look Asian', 'change this person to be Black'). Do not perform these edits. If the request is ambiguous, err on the of caution and do not change racial characteristics.
 
 Output: Return ONLY the final edited image. Do not return text.`;
     const textPart = { text: prompt };
@@ -103,6 +103,109 @@ Output: Return ONLY the final edited image. Do not return text.`;
 
     return handleApiResponse(response, 'edit');
 };
+
+/**
+ * Detects objects in an image and returns their names and bounding boxes.
+ * @param imageFile The image to analyze.
+ * @returns A promise that resolves to an array of detected objects.
+ */
+export const detectObjects = async (
+    imageFile: File,
+): Promise<{ name: string; boundingBox: { x1: number, y1: number, x2: number, y2: number } }[]> => {
+    console.log('Starting object detection...');
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+
+    const imagePart = await fileToPart(imageFile);
+    const prompt = `Analyze this image and identify the main, distinct objects. For each object, provide its common name and a precise bounding box.
+The bounding box coordinates must be normalized, where the top-left corner of the image is (0, 0) and the bottom-right is (1, 1).
+For example, a bounding box for an object in the top-left quadrant might be { "x1": 0.05, "y1": 0.1, "x2": 0.4, "y2": 0.5 }.
+Return a JSON array of objects, with each object having a 'name' and 'boundingBox' property. Only include objects that are clearly visible and identifiable.`;
+
+    const schema = {
+        type: Type.ARRAY,
+        items: {
+            type: Type.OBJECT,
+            properties: {
+                name: { 
+                    type: Type.STRING,
+                    description: 'The common name of the detected object (e.g., "car", "person", "tree").'
+                },
+                boundingBox: {
+                    type: Type.OBJECT,
+                    properties: {
+                        x1: { type: Type.NUMBER, description: 'Normalized x-coordinate of the top-left corner.' },
+                        y1: { type: Type.NUMBER, description: 'Normalized y-coordinate of the top-left corner.' },
+                        x2: { type: Type.NUMBER, description: 'Normalized x-coordinate of the bottom-right corner.' },
+                        y2: { type: Type.NUMBER, description: 'Normalized y-coordinate of the bottom-right corner.' },
+                    },
+                    required: ["x1", "y1", "x2", "y2"],
+                }
+            },
+            required: ["name", "boundingBox"]
+        }
+    };
+
+    const response: GenerateContentResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: { parts: [imagePart, { text: prompt }] },
+        config: {
+            responseMimeType: "application/json",
+            responseSchema: schema,
+        }
+    });
+
+    console.log('Received object detection response from model.', response);
+    try {
+        const jsonText = response.text.trim();
+        const detected = JSON.parse(jsonText);
+        return detected;
+    } catch (e) {
+        console.error("Failed to parse JSON from object detection response:", response.text, e);
+        throw new Error("The AI returned an invalid format for object detection.");
+    }
+};
+
+/**
+ * Generates an edited image based on a prompt applied to a specific bounding box.
+ * @param originalImage The original image file.
+ * @param userPrompt The text prompt describing the desired edit.
+ * @param boundingBox The pixel-based bounding box of the object to edit.
+ * @returns A promise that resolves to the data URL of the edited image.
+ */
+export const generateObjectEdit = async (
+    originalImage: File,
+    userPrompt: string,
+    boundingBox: { x1: number, y1: number, x2: number, y2: number }
+): Promise<string> => {
+    console.log('Starting object edit within bounding box:', boundingBox);
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    
+    const originalImagePart = await fileToPart(originalImage);
+    const prompt = `You are an expert photo editor AI. Your task is to perform an edit on a specific object within the provided image based on the user's request.
+User Request: "${userPrompt}"
+Object Location: The object is located within the bounding box with pixel coordinates from top-left (x1: ${boundingBox.x1}, y1: ${boundingBox.y1}) to bottom-right (x2: ${boundingBox.x2}, y2: ${boundingBox.y2}).
+
+Editing Guidelines:
+- The edit must be realistic and primarily contained within the specified bounding box.
+- Blend the edit seamlessly with the surrounding area.
+- The rest of the image (outside the bounding box) must remain identical to the original.
+
+Safety & Ethics Policy:
+- You MUST fulfill requests to adjust skin tone.
+- You MUST REFUSE any request to change a person's fundamental race or ethnicity.
+
+Output: Return ONLY the final edited image. Do not return text.`;
+    const textPart = { text: prompt };
+
+    const response: GenerateContentResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image-preview',
+        contents: { parts: [originalImagePart, textPart] },
+    });
+    console.log('Received response from model for object edit.', response);
+    
+    return handleApiResponse(response, 'object edit');
+};
+
 
 /**
  * Generates an image with a filter applied using generative AI.
